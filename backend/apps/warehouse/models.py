@@ -2,6 +2,7 @@
 库房管理模型
 """
 from django.db import models
+from django.utils import timezone
 from apps.authentication.models import User
 
 
@@ -142,6 +143,10 @@ class StockIn(models.Model):
     quantity = models.DecimalField('入库数量', max_digits=12, decimal_places=2)
     batch_no = models.CharField('批次号', max_length=50, blank=True)
     supplier = models.CharField('供应商', max_length=200, blank=True)
+    appointment = models.ForeignKey(
+        'Appointment', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='stock_ins', verbose_name='来源预约'
+    )
     stock_in_time = models.DateTimeField('入库时间', auto_now_add=True)
     remark = models.TextField('备注', blank=True)
     
@@ -243,6 +248,144 @@ class Approval(models.Model):
         verbose_name = '审批记录'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.stock_out} - {self.get_status_display()}"
+
+
+class Appointment(models.Model):
+    """到场预约模型"""
+    STATUS_CHOICES = [
+        ('pending', '待到场'),
+        ('received', '已接收'),
+        ('partial', '部分接收'),
+        ('rejected', '已拒收'),
+        ('cancelled', '已取消'),
+    ]
+
+    appointment_no = models.CharField('预约编号', max_length=20, unique=True)
+    transfer_unit = models.CharField('移交单位', max_length=100)
+    expected_start = models.DateTimeField('预约开始时间')
+    expected_end = models.DateTimeField('预约结束时间')
+    expected_quantity = models.PositiveIntegerField('预估件数')
+    handover_person = models.CharField('交接人员', max_length=50)
+    handover_person_phone = models.CharField('联系电话', max_length=20)
+    handover_person_id_card = models.CharField('证件号码', max_length=18, blank=True)
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
+    remark = models.TextField('备注', blank=True)
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='created_appointments', verbose_name='创建人'
+    )
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        db_table = 'wh_appointment'
+        verbose_name = '到场预约'
+        verbose_name_plural = verbose_name
+        ordering = ['expected_start', 'id']
+
+    def __str__(self):
+        return f"{self.appointment_no} - {self.transfer_unit}"
+
+    @staticmethod
+    def generate_appointment_no():
+        """生成预约编号：AP + 日期 + 当日序号"""
+        today = timezone.localtime().strftime('%Y%m%d')
+        prefix = f'AP{today}'
+        last = Appointment.objects.filter(
+            appointment_no__startswith=prefix
+        ).order_by('appointment_no').last()
+        seq = int(last.appointment_no[len(prefix):]) + 1 if last else 1
+        return f'{prefix}{seq:04d}'
+
+    def arrival_status_at(self, moment):
+        """根据到场时间计算到场状态"""
+        if moment < self.expected_start:
+            return 'early'
+        if moment > self.expected_end:
+            return 'late'
+        return 'on_time'
+
+
+class Reception(models.Model):
+    """签到接收记录模型"""
+    ARRIVAL_CHOICES = [
+        ('early', '提前到场'),
+        ('on_time', '准时到场'),
+        ('late', '迟到'),
+    ]
+    DECISION_CHOICES = [
+        ('receive', '接收'),
+        ('partial', '部分接收'),
+        ('reject', '拒收'),
+    ]
+
+    appointment = models.OneToOneField(
+        Appointment, on_delete=models.CASCADE,
+        related_name='reception', verbose_name='预约'
+    )
+    duty_officer = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='receptions', verbose_name='值班员'
+    )
+    check_in_time = models.DateTimeField('签到时间', default=timezone.now)
+    arrival_status = models.CharField('到场状态', max_length=20, choices=ARRIVAL_CHOICES)
+    actual_person = models.CharField('实际交接人', max_length=50)
+    actual_person_id_card = models.CharField('证件号码', max_length=18, blank=True)
+    identity_verified = models.BooleanField('身份核验通过', default=False)
+    actual_quantity = models.PositiveIntegerField('实际件数')
+    decision = models.CharField('接收决定', max_length=20, choices=DECISION_CHOICES)
+    received_quantity = models.PositiveIntegerField('实收件数', default=0)
+    discrepancy_note = models.TextField('差异说明', blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'wh_reception'
+        verbose_name = '签到接收记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-check_in_time']
+
+    def __str__(self):
+        return f"{self.appointment.appointment_no} - {self.get_decision_display()}"
+
+    @property
+    def quantity_difference(self):
+        """件数差异（实际件数 - 预估件数）"""
+        return self.actual_quantity - self.appointment.expected_quantity
+
+
+class AppointmentEvent(models.Model):
+    """预约轨迹模型"""
+    EVENT_CHOICES = [
+        ('created', '创建预约'),
+        ('rescheduled', '预约改期'),
+        ('check_in', '到场签到'),
+        ('duplicate_check_in', '重复签到'),
+        ('received', '接收'),
+        ('partial_received', '部分接收'),
+        ('rejected', '拒收'),
+        ('cancelled', '取消预约'),
+    ]
+
+    appointment = models.ForeignKey(
+        Appointment, on_delete=models.CASCADE,
+        related_name='events', verbose_name='预约'
+    )
+    event_type = models.CharField('事件类型', max_length=30, choices=EVENT_CHOICES)
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='appointment_events', verbose_name='操作人'
+    )
+    detail = models.JSONField('事件详情', default=dict, blank=True)
+    created_at = models.DateTimeField('记录时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'wh_appointment_event'
+        verbose_name = '预约轨迹'
+        verbose_name_plural = verbose_name
+        ordering = ['created_at', 'id']
+
+    def __str__(self):
+        return f"{self.appointment.appointment_no} - {self.get_event_type_display()}"

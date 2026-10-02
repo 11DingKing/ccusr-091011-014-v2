@@ -3,20 +3,28 @@
 """
 import logging
 import io
+from django.db import transaction
+from django.db.models import F
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    Appointment, Reception, AppointmentEvent
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    AppointmentSerializer, AppointmentListSerializer, AppointmentCreateSerializer,
+    AppointmentRescheduleSerializer, CheckInSerializer
 )
 
 logger = logging.getLogger('apps')
@@ -589,13 +597,37 @@ class GoodsListView(APIView):
 class StockInListView(APIView):
     """入库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.select_related(
+            'goods', 'operator', 'appointment'
+        ).order_by('-stock_in_time')
+
+        goods_id = request.query_params.get('goods')
+        appointment_id = request.query_params.get('appointment')
+        batch_no = request.query_params.get('batch_no')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        if appointment_id:
+            queryset = queryset.filter(appointment_id=appointment_id)
+        if batch_no:
+            queryset = queryset.filter(batch_no__icontains=batch_no)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        records = queryset[start:end]
+
+        serializer = StockInSerializer(records, many=True)
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
 
 
@@ -628,7 +660,7 @@ class WarningListView(APIView):
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         return success_response(data={
             'list': [],
@@ -636,3 +668,289 @@ class ApprovalListView(APIView):
             'page': 1,
             'page_size': 10
         })
+
+
+# ==================== 到场预约 ====================
+
+class AppointmentListView(APIView):
+    """到场预约列表视图"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = Appointment.objects.select_related('reception').order_by('expected_start', 'id')
+
+        status = request.query_params.get('status')
+        transfer_unit = request.query_params.get('transfer_unit')
+        date = request.query_params.get('date')
+        if status:
+            queryset = queryset.filter(status=status)
+        if transfer_unit:
+            queryset = queryset.filter(transfer_unit__icontains=transfer_unit)
+        if date:
+            queryset = queryset.filter(expected_start__date=date)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        appointments = queryset[start:end]
+
+        serializer = AppointmentListSerializer(appointments, many=True)
+
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
+        })
+
+    def post(self, request):
+        """创建到场预约"""
+        serializer = AppointmentCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        with transaction.atomic():
+            appointment = Appointment.objects.create(
+                appointment_no=Appointment.generate_appointment_no(),
+                created_by=request.user,
+                **data
+            )
+            AppointmentEvent.objects.create(
+                appointment=appointment,
+                event_type='created',
+                actor=request.user,
+                detail={
+                    'transfer_unit': appointment.transfer_unit,
+                    'expected_start': appointment.expected_start.isoformat(),
+                    'expected_end': appointment.expected_end.isoformat(),
+                    'expected_quantity': appointment.expected_quantity,
+                    'handover_person': appointment.handover_person,
+                }
+            )
+
+        logger.info(
+            f"User {request.user.username} created appointment "
+            f"{appointment.appointment_no} for {appointment.transfer_unit}"
+        )
+
+        return success_response(data=AppointmentSerializer(appointment).data, message='创建成功')
+
+
+class AppointmentDetailView(APIView):
+    """到场预约详情视图（含签到记录、轨迹与入库记录）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            appointment = Appointment.objects.get(pk=pk)
+        except Appointment.DoesNotExist:
+            return error_response(message='预约不存在', code=404)
+
+        return success_response(data=AppointmentSerializer(appointment).data)
+
+
+class AppointmentRescheduleView(APIView):
+    """预约改期视图"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            appointment = Appointment.objects.get(pk=pk)
+        except Appointment.DoesNotExist:
+            return error_response(message='预约不存在', code=404)
+
+        if appointment.status != 'pending':
+            return error_response(message='仅待到场的预约可以改期')
+
+        serializer = AppointmentRescheduleSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        old_start = appointment.expected_start
+        old_end = appointment.expected_end
+
+        with transaction.atomic():
+            appointment.expected_start = data['expected_start']
+            appointment.expected_end = data['expected_end']
+            appointment.save(update_fields=['expected_start', 'expected_end', 'updated_at'])
+            AppointmentEvent.objects.create(
+                appointment=appointment,
+                event_type='rescheduled',
+                actor=request.user,
+                detail={
+                    'old_start': old_start.isoformat(),
+                    'old_end': old_end.isoformat(),
+                    'new_start': appointment.expected_start.isoformat(),
+                    'new_end': appointment.expected_end.isoformat(),
+                    'reason': data.get('reason', ''),
+                }
+            )
+
+        logger.info(
+            f"User {request.user.username} rescheduled appointment {appointment.appointment_no}"
+        )
+
+        return success_response(data=AppointmentSerializer(appointment).data, message='改期成功')
+
+
+class AppointmentCancelView(APIView):
+    """预约取消视图"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            appointment = Appointment.objects.get(pk=pk)
+        except Appointment.DoesNotExist:
+            return error_response(message='预约不存在', code=404)
+
+        if appointment.status != 'pending':
+            return error_response(message='仅待到场的预约可以取消')
+
+        with transaction.atomic():
+            appointment.status = 'cancelled'
+            appointment.save(update_fields=['status', 'updated_at'])
+            AppointmentEvent.objects.create(
+                appointment=appointment,
+                event_type='cancelled',
+                actor=request.user,
+                detail={'reason': request.data.get('reason', '')}
+            )
+
+        logger.info(
+            f"User {request.user.username} cancelled appointment {appointment.appointment_no}"
+        )
+
+        return success_response(data=AppointmentSerializer(appointment).data, message='取消成功')
+
+
+class AppointmentCheckInView(APIView):
+    """到场签到视图：值班员核对身份与数量并决定接收、部分接收或拒收"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        with transaction.atomic():
+            try:
+                appointment = Appointment.objects.select_for_update().get(pk=pk)
+            except Appointment.DoesNotExist:
+                return error_response(message='预约不存在', code=404)
+
+            if appointment.status != 'pending':
+                reception = getattr(appointment, 'reception', None)
+                if reception is not None:
+                    # 重复签到：拒绝并保留轨迹
+                    AppointmentEvent.objects.create(
+                        appointment=appointment,
+                        event_type='duplicate_check_in',
+                        actor=request.user,
+                        detail={
+                            'attempted_at': timezone.now().isoformat(),
+                            'original_check_in_time': reception.check_in_time.isoformat(),
+                            'appointment_status': appointment.status,
+                        }
+                    )
+                    return error_response(message='该预约已完成签到，请勿重复签到')
+                return error_response(message='预约已取消，无法签到')
+
+            serializer = CheckInSerializer(data=request.data)
+            if not serializer.is_valid():
+                errors = serializer.errors
+                first_error = list(errors.values())[0]
+                if isinstance(first_error, list):
+                    first_error = first_error[0]
+                return error_response(message=str(first_error))
+
+            data = serializer.validated_data
+            now = timezone.now()
+            arrival_status = appointment.arrival_status_at(now)
+            decision = data['decision']
+
+            reception = Reception.objects.create(
+                appointment=appointment,
+                duty_officer=request.user,
+                check_in_time=now,
+                arrival_status=arrival_status,
+                actual_person=data['actual_person'],
+                actual_person_id_card=data.get('actual_person_id_card', ''),
+                identity_verified=data['identity_verified'],
+                actual_quantity=data['actual_quantity'],
+                decision=decision,
+                received_quantity=data['received_quantity'],
+                discrepancy_note=data.get('discrepancy_note', ''),
+            )
+
+            status_map = {'receive': 'received', 'partial': 'partial', 'reject': 'rejected'}
+            appointment.status = status_map[decision]
+            appointment.save(update_fields=['status', 'updated_at'])
+
+            AppointmentEvent.objects.create(
+                appointment=appointment,
+                event_type='check_in',
+                actor=request.user,
+                detail={
+                    'check_in_time': now.isoformat(),
+                    'arrival_status': arrival_status,
+                    'expected_start': appointment.expected_start.isoformat(),
+                    'expected_end': appointment.expected_end.isoformat(),
+                    'actual_person': reception.actual_person,
+                    'identity_verified': reception.identity_verified,
+                    'expected_quantity': appointment.expected_quantity,
+                    'actual_quantity': reception.actual_quantity,
+                }
+            )
+
+            # 接收或部分接收时生成正式入库记录并更新库存
+            stock_in_ids = []
+            if decision in ('receive', 'partial'):
+                for item in data.get('stock_ins', []):
+                    stock_in = StockIn.objects.create(
+                        goods_id=item['goods'],
+                        operator=request.user,
+                        quantity=item['quantity'],
+                        batch_no=item.get('batch_no', ''),
+                        supplier=appointment.transfer_unit,
+                        appointment=appointment,
+                        remark=item.get('remark', ''),
+                    )
+                    Goods.objects.filter(pk=item['goods']).update(
+                        quantity=F('quantity') + item['quantity']
+                    )
+                    stock_in_ids.append(stock_in.id)
+
+            event_map = {
+                'receive': 'received',
+                'partial': 'partial_received',
+                'reject': 'rejected',
+            }
+            AppointmentEvent.objects.create(
+                appointment=appointment,
+                event_type=event_map[decision],
+                actor=request.user,
+                detail={
+                    'decision': decision,
+                    'expected_quantity': appointment.expected_quantity,
+                    'actual_quantity': reception.actual_quantity,
+                    'received_quantity': reception.received_quantity,
+                    'discrepancy_note': reception.discrepancy_note,
+                    'stock_in_ids': stock_in_ids,
+                }
+            )
+
+        logger.info(
+            f"User {request.user.username} checked in appointment "
+            f"{appointment.appointment_no}: {arrival_status}, decision={decision}"
+        )
+
+        return success_response(data=AppointmentSerializer(appointment).data, message='签到完成')
