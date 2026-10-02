@@ -124,6 +124,7 @@ class OperationLogMiddleware:
             '/api/units/': '单位管理',
             '/api/categories/': '品类管理',
             '/api/varieties/': '品种管理',
+            '/api/appointments/': '预约管理',
             '/api/attendance-persons/': '考勤人员管理',
             '/api/stock-out-persons/': '出库人员管理',
             '/api/approvals/': '审批管理',

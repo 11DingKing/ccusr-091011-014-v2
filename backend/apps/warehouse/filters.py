@@ -58,12 +58,13 @@ class GoodsFilter(django_filters.FilterSet):
 class StockInFilter(django_filters.FilterSet):
     """入库记录过滤器"""
     goods_id = django_filters.NumberFilter(field_name='goods_id')
+    appointment_id = django_filters.NumberFilter(field_name='appointment_id')
     start_date = django_filters.DateFilter(field_name='stock_in_time', lookup_expr='date__gte')
     end_date = django_filters.DateFilter(field_name='stock_in_time', lookup_expr='date__lte')
-    
+
     class Meta:
         model = StockIn
-        fields = ['goods_id', 'start_date', 'end_date']
+        fields = ['goods_id', 'appointment_id', 'start_date', 'end_date']
 
 
 class StockOutFilter(django_filters.FilterSet):

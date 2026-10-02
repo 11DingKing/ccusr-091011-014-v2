@@ -139,6 +139,11 @@ class StockIn(models.Model):
         User, on_delete=models.SET_NULL, null=True,
         related_name='stock_in_operations', verbose_name='操作人'
     )
+    appointment = models.ForeignKey(
+        'appointments.Appointment', on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='stock_ins', verbose_name='关联预约'
+    )
     quantity = models.DecimalField('入库数量', max_digits=12, decimal_places=2)
     batch_no = models.CharField('批次号', max_length=50, blank=True)
     supplier = models.CharField('供应商', max_length=200, blank=True)

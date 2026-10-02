@@ -152,12 +152,14 @@ class StockInSerializer(serializers.ModelSerializer):
     """入库记录序列化器"""
     goods_name = serializers.CharField(source='goods.name', read_only=True)
     operator_name = serializers.CharField(source='operator.username', read_only=True)
-    
+    appointment_no = serializers.CharField(source='appointment.appointment_no', read_only=True)
+
     class Meta:
         model = StockIn
         fields = [
             'id', 'goods', 'goods_name', 'operator', 'operator_name',
-            'quantity', 'batch_no', 'supplier', 'stock_in_time', 'remark'
+            'quantity', 'batch_no', 'supplier', 'stock_in_time', 'remark',
+            'appointment', 'appointment_no'
         ]
 
 
